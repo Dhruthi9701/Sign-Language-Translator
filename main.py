@@ -52,20 +52,30 @@ if not cap.isOpened():
     exit()
 print("Camera opened successfully")
 
-SEQ_LEN = 30  # or whatever you used for training
+SEQ_LEN = 45  # increased for better long gesture detection
 keypoints_buffer = []
 last_pred_idx = None
 prediction_text = "Loading..."
 
 # Improved prediction handling
 prediction_buffer = deque(maxlen=5)  # Store last 5 predictions for smoothing
-confidence_threshold = 0.5  # Lowered from 0.7 for better sensitivity
+confidence_threshold = 0.3  # Lowered to catch more correct predictions
 prediction_stability_threshold = 3  # How many consistent predictions needed
 
 # Center positioning variables
 center_prompt_active = False
 center_prompt_timer = 0
 CENTER_PROMPT_DURATION = 30  # Show prompt for 30 frames
+
+# Gesture state management variables
+gesture_state = "neutral"  # "neutral", "detecting", "predicted"
+neutral_frames = 0
+gesture_frames = 0
+NEUTRAL_THRESHOLD = 8  # Frames to confirm neutral position
+GESTURE_THRESHOLD = 5  # Frames to confirm gesture is being performed
+RESET_DELAY = 30  # Frames to wait before resetting to neutral
+reset_timer = 0
+last_gesture_prediction = None
 
 # Colors for grid lines (BGR)
 GRID_COLOR_DEFAULT = (192, 192, 192)  # Light Grey
@@ -117,6 +127,51 @@ def check_center_positioning(results, frame_width, frame_height):
     in_center = (center_x_min <= nose_x <= center_x_max)
     
     return in_center
+
+def detect_neutral_position(results):
+    """Detect if person is in neutral/standing straight position"""
+    if not results.pose_landmarks:
+        return False
+    
+    try:
+        # Get key pose landmarks
+        landmarks = results.pose_landmarks.landmark
+        
+        # Check if hands are down (not raised)
+        left_wrist = landmarks[15]  # Left wrist
+        right_wrist = landmarks[16]  # Right wrist
+        left_shoulder = landmarks[11]  # Left shoulder
+        right_shoulder = landmarks[12]  # Right shoulder
+        
+        # Check if wrists are below shoulders (hands down)
+        hands_down = (left_wrist.y > left_shoulder.y and right_wrist.y > right_shoulder.y)
+        
+        # Check if arms are close to body (not extended)
+        left_elbow = landmarks[13]  # Left elbow
+        right_elbow = landmarks[14]  # Right elbow
+        
+        # Calculate arm extension (distance from shoulder to wrist)
+        left_arm_extended = abs(left_wrist.x - left_shoulder.x) > 0.15
+        right_arm_extended = abs(right_wrist.x - right_shoulder.x) > 0.15
+        
+        arms_not_extended = not (left_arm_extended or right_arm_extended)
+        
+        # Check if person is standing relatively straight
+        nose = landmarks[0]  # Nose
+        left_ear = landmarks[3]  # Left ear
+        right_ear = landmarks[4]  # Right ear
+        
+        # Head should be roughly level (ears at similar height)
+        head_level = abs(left_ear.y - right_ear.y) < 0.05
+        
+        # Neutral position: hands down, arms not extended, head level
+        is_neutral = hands_down and arms_not_extended and head_level
+        
+        return is_neutral
+        
+    except Exception as e:
+        print(f"Error in neutral detection: {e}")
+        return False
 
 mp_drawing = mp.solutions.drawing_utils
 mp_holistic = mp.solutions.holistic
@@ -234,15 +289,50 @@ try:
                 mp_drawing.DrawingSpec(color=(245,66,230), thickness=2, circle_radius=2)
             )
 
+        # Detect neutral position
+        is_neutral = detect_neutral_position(results)
+        
         # Extract keypoints and predict gesture
         keypoints = extract_keypoints(results)
         keypoints_buffer.append(keypoints)
         if len(keypoints_buffer) > SEQ_LEN:
             keypoints_buffer.pop(0)
 
-        if len(keypoints_buffer) == SEQ_LEN:
+        # Gesture state management
+        if is_neutral:
+            neutral_frames += 1
+            gesture_frames = 0
+        else:
+            gesture_frames += 1
+            neutral_frames = 0
+        
+        # State transitions
+        if gesture_state == "neutral" and gesture_frames >= GESTURE_THRESHOLD:
+            gesture_state = "detecting"
+            prediction_buffer.clear()  # Clear old predictions
+            print("Gesture detected - starting prediction...")
+        
+        elif gesture_state == "detecting" and neutral_frames >= NEUTRAL_THRESHOLD:
+            gesture_state = "neutral"
+            print("Returned to neutral position")
+        
+        elif gesture_state == "predicted":
+            reset_timer += 1
+            if reset_timer >= RESET_DELAY:
+                gesture_state = "neutral"
+                reset_timer = 0
+                last_gesture_prediction = None
+                print("Reset to neutral - ready for next gesture")
+
+        # Prediction logic
+        if len(keypoints_buffer) == SEQ_LEN and gesture_state == "detecting":
             input_data = np.expand_dims(keypoints_buffer, axis=0).astype(np.float32)
             prediction = model.predict(input_data, verbose=0)
+            
+            # Get top 3 predictions for debugging
+            top_3_indices = np.argsort(prediction[0])[-3:][::-1]  # Get top 3 indices
+            top_3_confidences = prediction[0][top_3_indices]
+            
             pred_idx = np.argmax(prediction)
             confidence = np.max(prediction)
             
@@ -254,9 +344,16 @@ try:
             
             if confidence > confidence_threshold and stable_pred_idx is not None:
                 if stable_pred_idx < len(actions):
-                    if last_pred_idx != stable_pred_idx:
+                    # Only predict once per gesture
+                    if last_gesture_prediction != stable_pred_idx:
                         print(f"Predicted gesture: {actions[stable_pred_idx]} (Confidence: {confidence*100:.1f}%, Stability: {stability_score*100:.1f}%)")
-                        last_pred_idx = stable_pred_idx
+                        print(f"Top 3 predictions:")
+                        for i, (idx, conf) in enumerate(zip(top_3_indices, top_3_confidences)):
+                            if idx < len(actions):
+                                print(f"  {i+1}. {actions[idx]}: {conf*100:.1f}%")
+                        last_gesture_prediction = stable_pred_idx
+                        gesture_state = "predicted"
+                        reset_timer = 0
                     
                     # Color code based on confidence and stability
                     if confidence > 0.8 and stability_score > 0.8:
@@ -266,27 +363,54 @@ try:
                     else:
                         color = (0, 165, 255)  # Orange for lower confidence
                     
-                    prediction_text = f"{actions[stable_pred_idx]} ({confidence*100:.1f}%)"
+                    if gesture_state == "predicted":
+                        prediction_text = f"{actions[stable_pred_idx]} ({confidence*100:.1f}%)"
+                    else:
+                        prediction_text = "Detecting..."
+                        color = (128, 128, 128)
                 else:
                     print(f"Warning: Prediction index {stable_pred_idx} is out of bounds for actions array of size {len(actions)}")
                     prediction_text = "Unknown Gesture"
                     color = (0, 0, 255)  # Red for unknown
             else:
-                if len(prediction_buffer) < prediction_stability_threshold:
-                    prediction_text = "Building up predictions..."
-                else:
-                    prediction_text = "Detecting..."
+                # Show top 3 predictions even when below threshold for debugging
+                if len(prediction_buffer) >= 3:  # Only show after we have some predictions
+                    print(f"Below threshold. Top 3 predictions:")
+                    for i, (idx, conf) in enumerate(zip(top_3_indices, top_3_confidences)):
+                        if idx < len(actions):
+                            print(f"  {i+1}. {actions[idx]}: {conf*100:.1f}%")
+                
+                prediction_text = "Detecting..."
                 color = (128, 128, 128)  # Gray for detecting
-        else:
+        elif len(keypoints_buffer) < SEQ_LEN:
             prediction_text = f"Loading... ({len(keypoints_buffer)}/{SEQ_LEN})"
             color = (128, 128, 128)
+        else:
+            # Show appropriate message based on state
+            if gesture_state == "neutral":
+                prediction_text = "Stand straight - ready for gesture"
+                color = (128, 128, 128)
+            elif gesture_state == "predicted":
+                if last_gesture_prediction is not None and last_gesture_prediction < len(actions):
+                    prediction_text = f"{actions[last_gesture_prediction]} (Predicted)"
+                    color = (0, 255, 0)
+                else:
+                    prediction_text = "Gesture predicted"
+                    color = (0, 255, 0)
+            else:
+                prediction_text = "Detecting..."
+                color = (128, 128, 128)
 
         # Display prediction with color coding
         cv2.putText(image, prediction_text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
         
         # Display additional info
-        info_text = f"Buffer: {len(prediction_buffer)}/5 | Threshold: {confidence_threshold}"
+        info_text = f"State: {gesture_state.upper()} | Buffer: {len(prediction_buffer)}/5 | Threshold: {confidence_threshold}"
         cv2.putText(image, info_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        # Display neutral/gesture frame counters
+        counter_text = f"Neutral: {neutral_frames}/{NEUTRAL_THRESHOLD} | Gesture: {gesture_frames}/{GESTURE_THRESHOLD}"
+        cv2.putText(image, counter_text, (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         # Display center positioning prompt
         if center_prompt_active:
