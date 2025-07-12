@@ -1,7 +1,0 @@
-This file is intentionally deleted due to high storage consumption. 
-This file contained the downloaded videos from the dataset.
-A -> 100 videos
-B -> 100 videos
-C -> 100 videos
-
-Directory structure: downloaded_videos\<labelled videos>.mp3
